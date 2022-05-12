@@ -1,47 +1,6 @@
-/*
-Copyright (c) 2011, Movania Muhammad Mobeen
-All rights reserved.
-
-Redistribution and use in source and binary forms, with or without modification,
-are permitted provided that the following conditions are met:
-
-Redistributions of source code must retain the above copyright notice, this list
-of conditions and the following disclaimer.
-Redistributions in binary form must reproduce the above copyright notice, this list
-of conditions and the following disclaimer in the documentation and/or other
-materials provided with the distribution.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY
-EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
-OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT
-SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
-INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED
-TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
-OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
-ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH
-DAMAGE.
-*/
-
-//A simple cloth using position based dynamics based on the SIGGRAPH course notes
-//"Realtime Physics" http://www.matthiasmueller.info/realtimephysics/coursenotes.pdf using 
-//GLUT,GLEW and GLM libraries. This code is intended for beginners so that they may 
-//understand what is required to implement position based dynamics based cloth simulation.
-//
-//This code is under BSD license. If you make some improvements,
-//or are using this in your research, do let me know and I would appreciate
-//if you acknowledge this in your code or in your publication.
-//
-//Controls:
-//left click on any empty region to rotate, middle click to zoom 
-//left click and drag any point to drag it.
-//
-//Author: Movania Muhammad Mobeen
-//        School of Computer Engineering,
-//        Nanyang Technological University,
-//        Singapore.
-//Email : mova0002@e.ntu.edu.sg 
-//
+#include "cuda_runtime.h"
+#include "device_launch_parameters.h"
+#include <time.h>
 
 #include <GL/glew.h>
 #include <GL/wglew.h>
@@ -51,31 +10,109 @@ DAMAGE.
 #include <glm/gtc/matrix_transform.hpp> //for matrices
 #include <glm/gtc/type_ptr.hpp>
 
-// includes, cuda
-#include <cuda_runtime.h>
-#include <cuda_gl_interop.h>
-
-// Utilities and timing functions
-#include <helper_functions.h>    // includes cuda.h and cuda_runtime_api.h
-
-// CUDA helper functions
-#include <helper_cuda.h>         // helper functions for CUDA error check
-
-#include <vector_types.h>
+#include <thrust/host_vector.h>
+#include <thrust/device_vector.h>
 
 //undefine if u want to use the default bending constraint of pbd
 #define USE_TRIANGLE_BENDING_CONSTRAINT
 
 #pragma comment(lib, "glew32.lib")
 
-#define MAX_EPSILON_ERROR 10.0f
-#define THRESHOLD          0.30f
-#define REFRESH_DELAY     10 //ms
+using namespace std;
+const int width = 1024, height = 1024;
+
+#define PI 3.1415926536f
+#define EPSILON  0.0000001f
+
+int numX = 20, numY = 20; //these ar the number of quads
+const size_t total_points = (numX + 1) * (numY + 1);
+float fullsize = 4.0f;
+float halfsize = fullsize / 2.0f;
+
+char info[MAX_PATH] = { 0 };
+
+float timeStep = 1.0f / 60.0f; //1.0/60.0f;
+float currentTime = 0;
+double accumulator = timeStep;
+int selected_index = -1;
+float global_dampening = 0.98f; //DevO: 24.07.2011  //global velocity dampening !!!
+
+struct DistanceConstraint { int p1, p2;	float rest_length, k; float k_prime; };
+#ifdef USE_TRIANGLE_BENDING_CONSTRAINT
+struct BendingConstraint { int p1, p2, p3;	float rest_length, w, k; float k_prime; };
+#else
+struct BendingConstraint { int p1, p2, p3, p4;	float rest_length1, rest_length2, w1, w2, k; float k_prime; };
+#endif
+
+thrust::host_vector<GLushort> indices;
+thrust::host_vector<DistanceConstraint> d_constraints;
+
+thrust::device_vector<GLushort> dev_indices; // indices GPU
+
+
+thrust::host_vector<BendingConstraint> b_constraints;
+thrust::host_vector<float> phi0; //initial dihedral angle between adjacent triangles
+
+//particle system
+thrust::host_vector<glm::vec3> X; //position
+thrust::host_vector<glm::vec3> tmp_X; //predicted position
+thrust::host_vector<glm::vec3> V; //velocity
+thrust::host_vector<glm::vec3> F;
+thrust::host_vector<float> W; //inverse particle mass 
+thrust::host_vector<glm::vec3> Ri; //Ri = Xi-Xcm 
+
+//particle system GPU
+thrust::device_vector<glm::vec3> *dev_X; //position GPU
+thrust::device_vector<glm::vec3> *dev_tmp_X;
+thrust::device_vector<glm::vec3> *dev_F; // force gpu
+thrust::device_vector<float> *dev_W; //inverse particle mass GPU
+thrust::device_vector<glm::vec3> *dev_V; //velocity gpu
+int oldX = 0, oldY = 0;
+float rX = 15, rY = 0;
+int state = 1;
+float dist = -23;
+const int GRID_SIZE = 10;
+
+const size_t solver_iterations = 2; //number of solver iterations per step. PBD  
+
+float kBend = 0.5f;
+float kStretch = 0.25f;
+float kDamp = 0.00125f;
+glm::vec3 gravity = glm::vec3(0.0f, -0.00981f, 0.0f);
+glm::vec3 *dev_gravity;
+
+float mass = 1.f / (total_points);
+
+
+GLint viewport[4];
+GLdouble MV[16];
+GLdouble P[16];
+
+LARGE_INTEGER frequency;        // ticks per second
+LARGE_INTEGER t1, t2;           // ticks
+double frameTimeQP = 0;
+float frameTime = 0;
+
+
+glm::vec3 Up = glm::vec3(0, 1, 0), Right, viewDir;
+float startTime = 0, fps = 0;
+int totalFrames = 0;
+
+glm::mat4 ellipsoid, inverse_ellipsoid;
+int iStacks = 30;
+int iSlices = 30;
+float fRadius = 1;
+
+// Resolve constraint in object space
+thrust::host_vector<glm::vec3> center = glm::vec3(0, 0, 0); //object space center of ellipsoid
+thrust::device_vector<glm::vec3> *dev_center;
+float radius = 1;					 //object space radius of ellipsoid
+float *dev_radius;
 
 ////////////////////////////////////////////////////////////////////////////////
 // constants
-const unsigned int window_width = 512;
-const unsigned int window_height = 512;
+const unsigned int window_width = 1024;
+const unsigned int window_height = 1024;
 
 const unsigned int mesh_width = 256;
 const unsigned int mesh_height = 256;
@@ -132,116 +169,17 @@ void runCuda(struct cudaGraphicsResource** vbo_resource);
 void runAutoTest(int devID, char** argv, char* ref_file);
 void checkResultCuda(int argc, char** argv, const GLuint& vbo);
 
-const char* sSDKsample = "simpleGL (VBO)";
-
-using namespace std;
-const int width = 1024, height = 1024;
-
-#define PI 3.1415926536f
-#define EPSILON  0.0000001f
-
-int numX = 20, numY = 20; //these ar the number of quads
-const size_t total_points = (numX + 1) * (numY + 1);
-float fullsize = 4.0f;
-float halfsize = fullsize / 2.0f;
-
-char info[MAX_PATH] = { 0 };
-
-float timeStep = 1.0f / 60.0f; //1.0/60.0f;
-float currentTime = 0;
-double accumulator = timeStep;
-int selected_index = -1;
-float global_dampening = 0.98f; //DevO: 24.07.2011  //global velocity dampening !!!
-
-struct DistanceConstraint { int p1, p2;	float rest_length, k; float k_prime; };
-#ifdef USE_TRIANGLE_BENDING_CONSTRAINT
-struct BendingConstraint { int p1, p2, p3;	float rest_length, w, k; float k_prime; };
-#else
-struct BendingConstraint { int p1, p2, p3, p4;	float rest_length1, rest_length2, w1, w2, k; float k_prime; };
-#endif
-
-vector<GLushort> indices;
-vector<DistanceConstraint> d_constraints;
-
-vector<BendingConstraint> b_constraints;
-vector<float> phi0; //initial dihedral angle between adjacent triangles
-
-//particle system
-vector<glm::vec3> X; //position
-vector<glm::vec3> tmp_X; //predicted position
-vector<glm::vec3> V; //velocity
-vector<glm::vec3> F;
-vector<float> W; //inverse particle mass 
-vector<glm::vec3> Ri; //Ri = Xi-Xcm 
-
-int oldX = 0, oldY = 0;
-float rX = 15, rY = 0;
-int state = 1;
-float dist = -23;
-const int GRID_SIZE = 10;
-
-const size_t solver_iterations = 2; //number of solver iterations per step. PBD  
-
-float kBend = 0.5f;
-float kStretch = 0.25f;
-float kDamp = 0.00125f;
-glm::vec3 gravity = glm::vec3(0.0f, -0.00981f, 0.0f);
-
-float mass = 1.f / (total_points);
+const char* sSDKsample = "CUDA CLOTH (VBO)";
 
 
-GLint viewport[4];
-GLdouble MV[16];
-GLdouble P[16];
 
-LARGE_INTEGER frequency;        // ticks per second
-LARGE_INTEGER t1, t2;           // ticks
-double frameTimeQP = 0;
-float frameTime = 0;
+void StepPhysics(float dt);
 
-
-glm::vec3 Up = glm::vec3(0, 1, 0), Right, viewDir;
-float startTime = 0, fps = 0;
-int totalFrames = 0;
-
-__global__ void kernel(float4* pos, unsigned int width, unsigned int height, float time)
-{
-	unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
-	unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
-
-	// calculate coordinates
-	float u = x / (float)width;
-	float v = y / (float)height;
-	u = u * 2.0f - 1.0f;
-	v = v * 2.0f - 1.0f;
-
-	float freq = 4.0f;
-	float w = sinf(u * freq + time) * cosf(v * freq + time) * 0.5f;
-
-	// write output vertex
-	pos[y * width + x] = make_float4(u, w, v, 1.0f);
-}
-
-
-void launch_kernel(float4* pos, unsigned int mesh_width,
-	unsigned int mesh_height, float time)
-{
-	// execute the kernel
-	dim3 block(8, 8, 1);
-	dim3 grid(mesh_width / block.x, mesh_height / block.y, 1);
-	kernel << < grid, block >> > (pos, mesh_width, mesh_height, time);
-}
-
-
-__device__ void StepPhysics(float dt);
-
-__device__
 float GetArea(int a, int b, int c) {
 	glm::vec3 e1 = X[b] - X[a];
 	glm::vec3 e2 = X[c] - X[a];
 	return 0.5f * glm::length(glm::cross(e1, e2));
 }
-__device__ 
 void AddDistanceConstraint(int a, int b, float k) {
 	DistanceConstraint c;
 	c.p1 = a;
@@ -258,7 +196,6 @@ void AddDistanceConstraint(int a, int b, float k) {
 	d_constraints.push_back(c);
 }
 #ifdef USE_TRIANGLE_BENDING_CONSTRAINT
-__device__ 
 void AddBendingConstraint(int pa, int pb, int pc, float k) {
 	BendingConstraint c;
 	c.p1 = pa;
@@ -372,20 +309,27 @@ void OnMouseMove(int x, int y)
 	glutPostRedisplay();
 }
 
+__global__ void DrawGridKernel()
+{
+	int i = threadId.x + blockId.x * blockDim.x;
 
-__device__
+	glVertex3f((float)i, 0, (float)-GRID_SIZE);
+	glVertex3f((float)i, 0, (float)GRID_SIZE);
+
+	glVertex3f((float)-GRID_SIZE, 0, (float)i);
+	glVertex3f((float)GRID_SIZE, 0, (float)i);
+}
+
 void DrawGrid()
 {
 	glBegin(GL_LINES);
 	glColor3f(0.5f, 0.5f, 0.5f);
-	for (int i = -GRID_SIZE; i <= GRID_SIZE; i++)
-	{
-		glVertex3f((float)i, 0, (float)-GRID_SIZE);
-		glVertex3f((float)i, 0, (float)GRID_SIZE);
 
-		glVertex3f((float)-GRID_SIZE, 0, (float)i);
-		glVertex3f((float)GRID_SIZE, 0, (float)i);
-	}
+	//draw grid
+	dim3 blocks(GRID_SIZE / 16, GRID_SIZE / 16);
+	dim3 threads(16, 16);
+	DrawGridKernel<<<blocks, threads>>> ();
+
 	glEnd();
 }
 
@@ -558,7 +502,11 @@ void InitGL() {
 	}
 #endif
 
-
+	//create a basic ellipsoid object
+	ellipsoid = glm::translate(glm::mat4(1), glm::vec3(0, 2, 0));
+	ellipsoid = glm::rotate(ellipsoid, 45.0f, glm::vec3(1, 0, 0));
+	ellipsoid = glm::scale(ellipsoid, glm::vec3(fRadius, fRadius, fRadius / 2));
+	inverse_ellipsoid = glm::inverse(ellipsoid);
 }
 
 void OnReshape(int nw, int nh) {
@@ -572,6 +520,8 @@ void OnReshape(int nw, int nh) {
 
 	glMatrixMode(GL_MODELVIEW);
 }
+
+
 
 void OnRender() {
 	size_t i = 0;
@@ -620,10 +570,14 @@ void OnRender() {
 	Up.y = (float)MV[5];
 	Up.z = (float)MV[9];
 
-	//draw grid
 	DrawGrid();
 
-
+	//draw ellipsoid
+	glColor3f(0, 1, 0);
+	glPushMatrix();
+	glMultMatrixf(glm::value_ptr(ellipsoid));
+	glutWireSphere(fRadius, iSlices, iStacks);
+	glPopMatrix();
 
 
 	//draw polygons
@@ -691,18 +645,54 @@ void OnShutdown() {
 	Ri.clear();
 }
 
-void ComputeForces() {
-	size_t i = 0;
+void ComputeForces() 
+{
+  dim3 blocks(GRID_SIZE / 16, GRID_SIZE / 16);
+  dim3 threads(16, 16);
+  cudaEvent_t start, stop;
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
 
-	for (i = 0; i < total_points; i++) {
-		F[i] = glm::vec3(0);
+  cudaMalloc( (void**)&dev_F, F.size());
+  cudaMalloc( (void**)&dev_W, W.size());
+  cudaMalloc( (void**)&dev_gravity, gravity.size());
 
-		//add gravity force
-		if (W[i] > 0)
-			F[i] += gravity;
-	}
+  cudaMemcpy(dev_F, F, F.size(), cudaMemcpyHostToDevice);
+  cudaMemcpy(dev_W, W, W.size(), cudaMemcpyHostToDevice);
+  cudaMemcpy(dev_gravity, gravity, gravity.size(), cudaMemcpyHostToDevice);
+
+  cudaEventRecord(start);
+  
+  ComputeForcesKernel<<<blocks, threads>>> (dev_F, dev_W, dev_gravity);
+  
+  cudaEventRecord(stop);
+  
+  cudaDeviceSynchronize();
+  
+  cudaMemcpy(F, dev_F, F.size(), cudaMemcpyDeviceToHost);
+  cudaMemcpy(W, dev_W, W.size(), cudaMemcpyDeviceToHost);
+  cudaMemcpy(gravity, dev_gravity, gravity.size(), cudaMemcpyDeviceToHost);
+  cudaEventSynchronize(stop);
+  float dt3 = 0;
+  cudaEventElapsedTime(&dt3, start, stop);
+  printf("Total time on GPU for ComputeForces: %f msecs\n", dt3);
+
+
+} 
+
+
+_global_ void ComputeForcesKernel(thrust::device_vector<glm::vec3> *dev_F, thrust::device_vector<float> *dev_W, glm::vec3 *dev_gravity)
+{
+  int i = threadId.x + blockId.x * blockDim.x;
+  dev_F[i] = glm::vec3(0); 
+  //add gravity force
+  if(dev_W[i]>0)
+    dev_F[i] += dev_gravity;    
+  __syncthreads(); 
+ 
 }
-__device__
+
+
 void IntegrateExplicitWithDamping(float deltaTime) {
 	float deltaTimeMass = deltaTime;
 	size_t i = 0;
@@ -761,17 +751,43 @@ void IntegrateExplicitWithDamping(float deltaTime) {
 		}
 	}
 }
-__device__
-void Integrate(float deltaTime) {
-	float inv_dt = 1.0f / deltaTime;
-	size_t i = 0;
 
-	for (i = 0; i < total_points; i++) {
-		V[i] = (tmp_X[i] - X[i]) * inv_dt;
-		X[i] = tmp_X[i];
-	}
+void Integrate(float deltaTime) 
+{
+  dim3 blocks(GRID_SIZE / 16, GRID_SIZE / 16);
+  dim3 threads(16, 16);
+  cudaEvent_t start, stop;
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+  cudaMalloc( (void**)&dev_X, X.size());
+  cudaMalloc( (void**)&dev_V, V.size());
+  cudaMalloc( (void**)&dev_tmp_X, tmp_X.size());
+  cudaMemcpy(dev_X, X, X.size(), cudaMemcpyHostToDevice);
+  cudaMemcpy(dev_V, V, V.size(), cudaMemcpyHostToDevice);
+  cudaMemcpy(dev_tmp_X, tmp_X, tmp_X.size(), cudaMemcpyHostToDevice);
+  cudaEventRecord(start);
+  IntegrateKernel<<<blocks, threads>>> (deltaTime, dev_X, dev_V, dev_tmp_X);
+  cudaEventRecord(stop);
+  cudaDeviceSynchronize();
+  cudaMemcpy(X, dev_X, X.size(), cudaMemcpyDeviceToHost);
+  cudaMemcpy(V, dev_V, V.size(), cudaMemcpyDeviceToHost);
+  cudaMemcpy(tmp_X, dev_tmp_X, tmp_X.size(), cudaMemcpyDeviceToHost);
+  cudaEventSynchronize(stop);
+  float dt4 = 0;
+  cudaEventElapsedTime(&dt4, start, stop);
+  printf("Total time on GPU for Integrate: %f msecs\n", dt4);
 }
-__device__
+
+_global_ void IntegrateKernel(float deltaTime, thrust::device_vector<glm::vec3> *dev_X, thrust::device_vector<glm::vec3> *dev_V, thrust::device_vector<glm::vec3> *dev_tmp_X)
+{
+  float inv_dt = 1.0f / deltaTime;
+  int i = threadId.x + blockId.x * blockDim.x;
+  dev_V[i] = (dev_tmp_X[i] - dev_X[i]) * inv_dt;
+  dev_X[i] = dev_tmp_X[i];
+  __syncthreads(); 
+ 
+}
+
 void UpdateDistanceConstraint(int i) {
 
 	DistanceConstraint c = d_constraints[i];
@@ -794,7 +810,7 @@ void UpdateDistanceConstraint(int i) {
 	if (w2 > 0.0)
 		tmp_X[c.p2] += dP * w2;
 }
-__device__
+
 void UpdateBendingConstraint(int index) {
 	size_t i = 0;
 	BendingConstraint c = b_constraints[index];
@@ -931,17 +947,92 @@ void UpdateBendingConstraint(int index) {
 #endif
 }
 //----------------------------------------------------------------------------------------------------
-__device__
 void GroundCollision() //DevO: 24.07.2011
-{
-	for (size_t i = 0; i < total_points; i++) {
-		if (tmp_X[i].y < 0) //collision with ground
-			tmp_X[i].y = 0;
-	}
+{ 
+  dim3 blocks(GRID_SIZE / 16, GRID_SIZE / 16);
+  dim3 threads(16, 16);
+  cudaEvent_t start, stop;
+	cudaEventCreate(&start);
+	cudaEventCreate(&stop);
+  cudaMalloc( (void**)&dev_tmp_X, tmp_X.size());
+  cudaMemcpy(dev_tmp_X, tmp_X, tmp_X.size(), cudaMemcpyHostToDevice);
+  cudaEventRecord(start);
+  GroundCollisionKernel<<<blocks, threads>>> (dev_tmp_X);
+  cudaEventRecord(stop);
+  cudaDeviceSynchronize();
+  cudaMemcpy(tmp_X, dev_tmp_X, tmp_X.size(), cudaMemcpyDeviceToHost);
+  cudaEventSynchronize(stop);
+  float dt1 = 0;
+	cudaEventElapsedTime(&dt1, start, stop);
+  printf("Total time on GPU for GroundCollision: %f msecs\n", dt1);
+
 }
 
+_global_ void GroundCollisionKernel(thrust::device_vector<glm::vec3> *dev_tmp_X)
+{
+  
+  int i = threadId.x + blockId.x * blockDim.x;
+  if (dev_tmp_X[i].y < 0) //collision with ground
+    Dev_tmp_X[i].y = 0;
+  __syncthreads(); 
+ 
+}
+
+void EllipsoidCollision() 
+{
+  dim3 blocks(GRID_SIZE / 16, GRID_SIZE / 16);
+  dim3 threads(16, 16);
+  cudaEvent_t start, stop;
+	cudaEventCreate(&start);
+	cudaEventCreate(&stop);
+  cudaMalloc( (void**)&dev_center, center.size());
+  cudaMalloc( (void**)&dev_radius, radius.size());
+  cudaMemcpy(dev_center, center, center.size(), cudaMemcpyHostToDevice);
+  cudaMemcpy(dev_radius, radius, radius.size(), cudaMemcpyHostToDevice);
+  cudaEventRecord(start);
+  EllipsoidCollisionKernel<<<blocks, threads>>> (dev_center, dev_radius);
+  cudaEventRecord(stop);
+  cudaDeviceSynchronize();
+  cudaMemcpy(center, dev_center, center.size(), cudaMemcpyDeviceToHost);
+  cudaMemcpy(radius, dev_radius, radius.size(), cudaMemcpyDeviceToHost);
+  cudaEventSynchronize(stop);
+  float dt2 = 0;
+	cudaEventElapsedTime(&dt2, start, stop);
+  printf("Total time on GPU for EllipsoidCollision: %f msecs\n", dt2);
+}
+
+
+_global_ void EllipsoidCollisionKernel(thrust::device_vector<glm::vec3> *dev_center, float *dev_radius)
+{
+  int i = threadId.x + blockId.x * blockDim.x;
+  glm::vec4 X_0 = (inverse_ellipsoid * glm::vec4(tmp_X[i], 1));
+  glm::vec3 delta0 = glm::vec3(X_0.x, X_0.y, X_0.z) - dev_center;
+  float distance = glm::length(delta0);
+  if (distance < 1.0f) {
+    delta0 = (dev_radius - distance) * delta0 / distance;
+    // Transform the delta back to original space
+    glm::vec3 delta;
+    glm::vec3 transformInv;
+    transformInv = glm::vec3(ellipsoid[0].x, ellipsoid[1].x, ellipsoid[2].x);
+    transformInv /= glm::dot(transformInv, transformInv);
+    delta.x = glm::dot(delta0, transformInv);
+    transformInv = glm::vec3(ellipsoid[0].y, ellipsoid[1].y, ellipsoid[2].y);
+    transformInv /= glm::dot(transformInv, transformInv);
+    delta.y = glm::dot(delta0, transformInv);
+    transformInv = glm::vec3(ellipsoid[0].z, ellipsoid[1].z, ellipsoid[2].z);
+    transformInv /= glm::dot(transformInv, transformInv);
+    delta.z = glm::dot(delta0, transformInv);
+    tmp_X[i] += delta;
+    V[i] = glm::vec3(0);
+  __syncthreads(); 
+ 
+}
+
+
+void UpdateExternalConstraints() {
+	// EllipsoidCollision();
+}
 //----------------------------------------------------------------------------------------------------
-__device__
 void UpdateInternalConstraints(float deltaTime) {
 	size_t i = 0;
 
@@ -988,6 +1079,7 @@ void StepPhysics(float dt) {
 
 	// for collision constraints
 	UpdateInternalConstraints(dt);
+	UpdateExternalConstraints();
 
 	Integrate(dt);
 }
@@ -1011,7 +1103,7 @@ void display()
 {
 	sdkStartTimer(&timer);
 
-	// run CUDA kernel to generate vertex positions
+	// run CUDA kernel to generate 
 	runCuda(&cuda_vbo_resource);
 
 	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -1034,20 +1126,6 @@ void display()
 
 	glutSwapBuffers();
 
-	g_fAnim += 0.01f;
-
-	sdkStopTimer(&timer);
-	computeFPS();
-}
-
-
-void main(int argc, char** argv) {
-
-	glutInit(&argc, argv);
-	glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGBA | GLUT_DEPTH);
-	glutInitWindowSize(width, height);
-	glutCreateWindow("GLUT Cloth Demo [Position based Dynamics]");
-
 	glutDisplayFunc(OnRender);
 	glutReshapeFunc(OnReshape);
 	glutIdleFunc(OnIdle);
@@ -1061,4 +1139,19 @@ void main(int argc, char** argv) {
 	InitGL();
 
 	glutMainLoop();
+
+	g_fAnim += 0.01f;
+
+	sdkStopTimer(&timer);
+	computeFPS();
+}
+
+void main(int argc, char** argv) {
+
+	glutInit(&argc, argv);
+	glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGBA | GLUT_DEPTH);
+	glutInitWindowSize(width, height);
+	glutCreateWindow("CUDA Open Cloth Demo PBD");
+
+	display()
 }
